@@ -14,6 +14,7 @@ All measurements are read locally over Bluetooth Low Energy. The Blue Connect cl
 - MQTT state and diagnostics topics
 - Home Assistant MQTT Discovery
 - Small local web interface
+- Live BLE scan results in the web interface
 - Optional fixed Blue Connect MAC address
 - Retry after failed reads
 - Raw payload and diagnostics for calibration/debugging
@@ -57,6 +58,45 @@ Important: chlorine, EC, and salt are estimates derived from the BLE payload and
 8. Open the serial monitor at `115200` baud.
 
 `include/secrets.h` is ignored by Git and should not be committed.
+
+## Dependencies
+
+The project uses PlatformIO and pins the BLE stack to `h2zero/NimBLE-Arduino@1.4.3`.
+
+NimBLE-Arduino 2.x changes parts of the scan and connection behavior. This firmware currently targets 1.4.3 because it has been more reliable with the tested Blue Connect Go device.
+
+## Upload
+
+The first upload must be done over USB so the OTA-enabled firmware is installed:
+
+```bash
+pio run -e esp32-c3-devkitm-1 -t upload
+```
+
+After the ESP32 is connected to Wi-Fi, later uploads can be done over the network:
+
+```bash
+pio run -e esp32-c3-devkitm-1-ota -t upload
+```
+
+The OTA environment uses `blueconnect-c3.local` as upload target. If mDNS does not work in your network, replace `upload_port` in `platformio.ini` with the ESP32 IP address.
+
+## Monitoring
+
+PlatformIO OTA only covers firmware upload. `pio device monitor` and the VS Code "Monitor" task still use a serial port, even when the OTA environment is selected. For live remote diagnostics over Wi-Fi, use the web UI, `/api/diagnostics`, or the MQTT diagnostics topic.
+
+USB serial monitor:
+
+```bash
+pio device monitor -e esp32-c3-devkitm-1
+```
+
+Remote status without USB:
+
+```text
+http://blueconnect-c3.local/
+http://blueconnect-c3.local/api/diagnostics
+```
 
 ## Configuration
 
@@ -150,9 +190,16 @@ If mDNS does not work in your network, use the IP address printed in the serial 
 Available endpoints:
 
 - `/` web UI
-- `/measure` manual measurement trigger
+- `/measure` queue a manual measurement trigger
+- `/scan` queue a BLE scan without reading measurements
 - `/api/state` current state as JSON
 - `/api/diagnostics` diagnostic JSON
+
+The web UI polls the JSON endpoints every 2 seconds, so measurements, scan state, RSSI, BLE scan results, and diagnostics update without reloading the page.
+
+The `Scan Results` section lists recently seen BLE advertisements from the last scan. Entries include MAC address, RSSI, advertised name, and whether the expected Blue Connect service UUID was present in that advertisement. Some Blue Connect advertisements do not expose the service UUID, so a fixed `BLUECONNECT_MAC_VALUE` is recommended.
+
+The firmware does not rely on a BLE `connectable` flag from scan results. On the tested Blue Connect Go this flag can be misleading even when a connection and measurement readout work correctly.
 
 ## Behavior
 
@@ -162,13 +209,15 @@ After that:
 
 - successful read: next automatic read after 15 minutes
 - failed read or BLE notification timeout: retry after 1 minute
-- manual `/measure` request: immediate read
+- manual `/measure` request: queues a read and redirects immediately
+
+The web UI and OTA handler are serviced during BLE scan and notification waits, so the device should remain reachable while a measurement is running. BLE connect and GATT discovery can still block briefly.
 
 The Blue Connect Go may not be continuously reachable over BLE. Make sure the official app is not actively connected while the ESP32 tries to read the sensor.
 
 ## Troubleshooting
 
-Serial monitor messages are the best first diagnostic source.
+Serial monitor messages are the best first diagnostic source when USB is connected. Without USB, use the live web UI, `/api/diagnostics`, or the retained MQTT diagnostics topic.
 
 Common messages:
 
@@ -179,6 +228,8 @@ Common messages:
 - MQTT reconnect loop: broker host, port, user, password, or network routing is wrong.
 
 The firmware publishes `raw_hex` and diagnostic data so that decoder formulas can be adjusted if your device firmware differs.
+
+For BLE discovery issues, press `Scan` in the web interface and compare `Target MAC` with the addresses listed under `Scan Results`.
 
 ## Security
 

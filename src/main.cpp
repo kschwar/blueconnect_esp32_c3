@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
@@ -11,10 +12,10 @@
 #endif
 
 #ifndef WIFI_SSID_VALUE
-#define WIFI_SSID_VALUE "DEIN_WLAN"
+#define WIFI_SSID_VALUE "YOUR_WIFI"
 #endif
 #ifndef WIFI_PASS_VALUE
-#define WIFI_PASS_VALUE "DEIN_PASSWORT"
+#define WIFI_PASS_VALUE "YOUR_WIFI_PASSWORD"
 #endif
 #ifndef MQTT_HOST_VALUE
 #define MQTT_HOST_VALUE "192.168.1.10"
@@ -33,7 +34,7 @@
 #endif
 
 // ================================================================
-// Benutzer-Konfiguration
+// User configuration
 // ================================================================
 static const char* WIFI_SSID = WIFI_SSID_VALUE;
 static const char* WIFI_PASS = WIFI_PASS_VALUE;
@@ -43,16 +44,16 @@ static const int   MQTT_PORT = MQTT_PORT_VALUE;
 static const char* MQTT_USER = MQTT_USER_VALUE;
 static const char* MQTT_PASS = MQTT_PASS_VALUE;
 
-// Optional: MAC-Adresse deines BlueConnect Go eintragen, z.B. "aa:bb:cc:dd:ee:ff".
-// Leer lassen, wenn per Service UUID gesucht werden soll.
+// Optional: set the MAC address of your Blue Connect Go, e.g. "aa:bb:cc:dd:ee:ff".
+// Leave empty to search by service UUID.
 static const char* BLUECONNECT_MAC = BLUECONNECT_MAC_VALUE;
 
 static const char* DEVICE_ID   = "blueconnect_go_esp32c3";
 static const char* DEVICE_NAME = "BlueConnect Go ESP32-C3";
 static const char* HOSTNAME    = "blueconnect-c3";
 
-static const uint32_t MEASURE_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 Minuten
-static const uint32_t MEASURE_RETRY_INTERVAL_MS = 60UL * 1000UL;  // 1 Minute nach Fehler
+static const uint32_t MEASURE_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 minutes
+static const uint32_t MEASURE_RETRY_INTERVAL_MS = 60UL * 1000UL;  // 1 minute after failure
 static const uint32_t BLE_SCAN_SECONDS    = 12;
 static const uint32_t BLE_NOTIFY_TIMEOUT_MS = 35000;
 static const bool ENABLE_DIAGNOSTICS = true;
@@ -99,10 +100,21 @@ Measurement last;
 volatile bool notificationReceived = false;
 std::string notificationPayload;
 NimBLEAdvertisedDevice* foundDevice = nullptr;
+static const uint8_t MAX_SCAN_RESULTS = 12;
 String lastAdvertisement = "";
+String scanResultAddresses[MAX_SCAN_RESULTS];
+String scanResultLines[MAX_SCAN_RESULTS];
+uint8_t scanResultCount = 0;
+uint32_t scanAdvertisementCount = 0;
 uint32_t lastScanMs = 0;
 uint32_t lastAttemptMs = 0;
+uint32_t lastMqttAttemptMs = 0;
 bool lastReadOk = false;
+bool measurementRequested = false;
+bool measurementInProgress = false;
+bool scanRequested = false;
+bool scanOnlyInProgress = false;
+bool targetSeen = false;
 
 String bytesToHex(const uint8_t* data, size_t len) {
   static const char* hex = "0123456789ABCDEF";
@@ -122,6 +134,66 @@ bool macMatches(const std::string& addr) {
   a.toLowerCase();
   b.toLowerCase();
   return a == b;
+}
+
+void resetScanResults() {
+  lastAdvertisement = "";
+  scanResultCount = 0;
+  scanAdvertisementCount = 0;
+  for (uint8_t i = 0; i < MAX_SCAN_RESULTS; i++) {
+    scanResultAddresses[i] = "";
+    scanResultLines[i] = "";
+  }
+}
+
+void rememberAdvertisement(const String& address, const String& line) {
+  scanAdvertisementCount++;
+  lastAdvertisement = line;
+
+  for (uint8_t i = 0; i < scanResultCount; i++) {
+    if (scanResultAddresses[i] == address) {
+      scanResultLines[i] = line;
+      return;
+    }
+  }
+
+  if (scanResultCount < MAX_SCAN_RESULTS) {
+    scanResultAddresses[scanResultCount] = address;
+    scanResultLines[scanResultCount] = line;
+    scanResultCount++;
+    return;
+  }
+
+  for (uint8_t i = 1; i < MAX_SCAN_RESULTS; i++) {
+    scanResultAddresses[i - 1] = scanResultAddresses[i];
+    scanResultLines[i - 1] = scanResultLines[i];
+  }
+  scanResultAddresses[MAX_SCAN_RESULTS - 1] = address;
+  scanResultLines[MAX_SCAN_RESULTS - 1] = line;
+}
+
+String htmlEscape(const String& value) {
+  String out;
+  out.reserve(value.length());
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
+String scanResultsText() {
+  if (scanResultCount == 0) return "No advertisements seen yet";
+  String out;
+  for (uint8_t i = 0; i < scanResultCount; i++) {
+    if (i > 0) out += "\n";
+    out += scanResultLines[i];
+  }
+  return out;
 }
 
 uint16_t readLe16(const uint8_t* data, size_t offset) {
@@ -188,39 +260,100 @@ void notifyCallback(NimBLERemoteCharacteristic* c, uint8_t* data, size_t length,
 
 class AdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
+    if (foundDevice) return;
+
+    const String address = advertisedDevice->getAddress().toString().c_str();
     const bool hasService = advertisedDevice->isAdvertisingService(BLUE_SERVICE_UUID);
     const bool hasTargetMac = macMatches(advertisedDevice->getAddress().toString());
+    const bool isTarget = (strlen(BLUECONNECT_MAC) > 0 && hasTargetMac) ||
+                          (strlen(BLUECONNECT_MAC) == 0 && hasService);
+
+    if (isTarget) {
+      targetSeen = true;
+    }
 
     if (ENABLE_DIAGNOSTICS) {
-      String line = String(advertisedDevice->getAddress().toString().c_str()) +
+      String line = address +
                     " RSSI=" + String(advertisedDevice->getRSSI()) +
                     " name=" + String(advertisedDevice->getName().c_str()) +
                     " service=" + String(hasService ? "yes" : "no");
-      lastAdvertisement = line;
+      rememberAdvertisement(address, line);
       Serial.println("[SCAN] " + line);
     }
 
-    if ((strlen(BLUECONNECT_MAC) > 0 && hasTargetMac) || (strlen(BLUECONNECT_MAC) == 0 && hasService)) {
+    if (isTarget) {
       foundDevice = new NimBLEAdvertisedDevice(*advertisedDevice);
       NimBLEDevice::getScan()->stop();
     }
   }
+
 };
 
+AdvertisedCallbacks advertisedCallbacks;
+
 void ensureMqtt();
+void handleBackground();
 void publishDiscovery();
 void publishState();
 void publishDiagnostics(const char* reason);
 
+String currentOperationState() {
+  if (measurementInProgress) return "measuring";
+  if (scanOnlyInProgress) return "scanning";
+  if (measurementRequested) return "measurement queued";
+  if (scanRequested) return "scan queued";
+  return "idle";
+}
+
+bool scanBlueConnectOnly() {
+  scanOnlyInProgress = true;
+  last.lastError = "scanning";
+  targetSeen = false;
+  resetScanResults();
+  if (foundDevice) { delete foundDevice; foundDevice = nullptr; }
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(&advertisedCallbacks, true);
+  scan->setActiveScan(true);
+  scan->setInterval(80);
+  scan->setWindow(40);
+
+  Serial.println("[BLE] Manual scan start");
+  lastScanMs = millis();
+  scan->start(BLE_SCAN_SECONDS, false);
+  scan->clearResults();
+
+  bool ok = false;
+  if (foundDevice) {
+    last.mac = foundDevice->getAddress().toString().c_str();
+    last.rssi = foundDevice->getRSSI();
+    last.lastError = "scan found blueconnect";
+    Serial.printf("[BLE] Scan found %s RSSI=%d\n", last.mac.c_str(), last.rssi);
+    delete foundDevice;
+    foundDevice = nullptr;
+    publishDiagnostics("scan_found");
+    ok = true;
+  } else {
+    last.lastError = "blueconnect not found";
+    publishDiagnostics("scan_not_found");
+  }
+
+  scanOnlyInProgress = false;
+  return ok;
+}
+
 bool scanAndReadBlueConnect() {
+  measurementInProgress = true;
   lastAttemptMs = millis();
   last.lastError = "scanning";
+  targetSeen = false;
+  resetScanResults();
   notificationReceived = false;
   notificationPayload.clear();
   if (foundDevice) { delete foundDevice; foundDevice = nullptr; }
 
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new AdvertisedCallbacks(), true);
+  scan->setAdvertisedDeviceCallbacks(&advertisedCallbacks, true);
   scan->setActiveScan(true);
   scan->setInterval(80);
   scan->setWindow(40);
@@ -232,6 +365,7 @@ bool scanAndReadBlueConnect() {
 
   if (!foundDevice) {
     last.lastError = "blueconnect not found";
+    measurementInProgress = false;
     publishDiagnostics("not_found");
     return false;
   }
@@ -246,6 +380,7 @@ bool scanAndReadBlueConnect() {
   if (!client->connect(foundDevice)) {
     last.lastError = "connect failed";
     NimBLEDevice::deleteClient(client);
+    measurementInProgress = false;
     publishDiagnostics("connect_failed");
     return false;
   }
@@ -255,6 +390,7 @@ bool scanAndReadBlueConnect() {
     last.lastError = "service not found";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    measurementInProgress = false;
     publishDiagnostics("service_not_found");
     return false;
   }
@@ -266,6 +402,7 @@ bool scanAndReadBlueConnect() {
     last.lastError = "characteristic not found";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    measurementInProgress = false;
     publishDiagnostics("characteristic_not_found");
     return false;
   }
@@ -275,6 +412,7 @@ bool scanAndReadBlueConnect() {
       last.lastError = "notify subscribe failed";
       client->disconnect();
       NimBLEDevice::deleteClient(client);
+      measurementInProgress = false;
       publishDiagnostics("notify_subscribe_failed");
       return false;
     }
@@ -282,6 +420,7 @@ bool scanAndReadBlueConnect() {
     last.lastError = "notify characteristic cannot notify";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    measurementInProgress = false;
     publishDiagnostics("notify_not_supported");
     return false;
   }
@@ -292,12 +431,14 @@ bool scanAndReadBlueConnect() {
     last.lastError = "write trigger failed";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    measurementInProgress = false;
     publishDiagnostics("write_failed");
     return false;
   }
 
   uint32_t start = millis();
   while (!notificationReceived && millis() - start < BLE_NOTIFY_TIMEOUT_MS) {
+    handleBackground();
     delay(20);
   }
 
@@ -323,6 +464,7 @@ bool scanAndReadBlueConnect() {
   } else {
     publishDiagnostics("parse_or_timeout_failed");
   }
+  measurementInProgress = false;
   return ok;
 }
 
@@ -332,6 +474,7 @@ void connectWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) {
+    ArduinoOTA.handle();
     delay(500);
     Serial.print(".");
   }
@@ -343,24 +486,49 @@ void connectWifi() {
   }
 }
 
+void setupOta() {
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA
+    .onStart([]() {
+      Serial.println("[OTA] Start");
+    })
+    .onEnd([]() {
+      Serial.println("\n[OTA] End");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("[OTA] Progress: %u%%\r", (progress * 100) / total);
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("[OTA] Error[%u]\n", error);
+    });
+  ArduinoOTA.begin();
+  Serial.printf("[OTA] Ready: %s.local\n", HOSTNAME);
+}
+
+void handleBackground() {
+  ArduinoOTA.handle();
+  server.handleClient();
+  mqtt.loop();
+}
+
 void ensureMqtt() {
   if (mqtt.connected()) return;
+  if (millis() - lastMqttAttemptMs < 3000) return;
+  lastMqttAttemptMs = millis();
+
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
 
-  while (!mqtt.connected()) {
-    Serial.printf("[MQTT] Connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
-    bool ok;
-    if (strlen(MQTT_USER) > 0) ok = mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS, TOPIC_AVAIL, 1, true, "offline");
-    else ok = mqtt.connect(DEVICE_ID, TOPIC_AVAIL, 1, true, "offline");
+  Serial.printf("[MQTT] Connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
+  bool ok;
+  if (strlen(MQTT_USER) > 0) ok = mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS, TOPIC_AVAIL, 1, true, "offline");
+  else ok = mqtt.connect(DEVICE_ID, TOPIC_AVAIL, 1, true, "offline");
 
-    if (ok) {
-      Serial.println("[MQTT] Connected");
-      mqtt.publish(TOPIC_AVAIL, "online", true);
-      publishDiscovery();
-    } else {
-      Serial.printf("[MQTT] failed rc=%d\n", mqtt.state());
-      delay(3000);
-    }
+  if (ok) {
+    Serial.println("[MQTT] Connected");
+    mqtt.publish(TOPIC_AVAIL, "online", true);
+    publishDiscovery();
+  } else {
+    Serial.printf("[MQTT] failed rc=%d\n", mqtt.state());
   }
 }
 
@@ -400,6 +568,11 @@ void publishDiagnostics(const char* reason) {
   doc["reason"] = reason;
   doc["last_error"] = last.lastError;
   doc["last_advertisement"] = lastAdvertisement;
+  doc["scan_seen_count"] = scanAdvertisementCount;
+  JsonArray scanResults = doc["scan_results"].to<JsonArray>();
+  for (uint8_t i = 0; i < scanResultCount; i++) {
+    scanResults.add(scanResultLines[i]);
+  }
   doc["free_heap"] = ESP.getFreeHeap();
   doc["uptime_s"] = millis() / 1000;
   doc["wifi_rssi"] = WiFi.RSSI();
@@ -430,14 +603,14 @@ void discoverySensor(const char* objectId, const char* name, const char* deviceC
 }
 
 void publishDiscovery() {
-  discoverySensor("temperature", "Pool Temperatur", "temperature", "°C", "{{ value_json.temperature }}");
+  discoverySensor("temperature", "Pool Temperature", "temperature", "°C", "{{ value_json.temperature }}");
   discoverySensor("ph", "Pool pH", "ph", "pH", "{{ value_json.ph }}");
   discoverySensor("orp", "Pool ORP", "voltage", "mV", "{{ value_json.orp }}");
-  discoverySensor("chlorine", "Pool Freies Chlor", "", "ppm", "{{ value_json.chlorine }}");
-  discoverySensor("ec", "Pool Leitfähigkeit", "", "µS/cm", "{{ value_json.ec }}");
-  discoverySensor("salt", "Pool Salz", "", "ppm", "{{ value_json.salt }}");
-  discoverySensor("battery", "BlueConnect Batterie", "battery", "%", "{{ value_json.battery }}");
-  discoverySensor("battery_voltage", "BlueConnect Batteriespannung", "voltage", "V", "{{ value_json.battery_voltage }}");
+  discoverySensor("chlorine", "Pool Free Chlorine", "", "ppm", "{{ value_json.chlorine }}");
+  discoverySensor("ec", "Pool Conductivity", "", "µS/cm", "{{ value_json.ec }}");
+  discoverySensor("salt", "Pool Salt", "", "ppm", "{{ value_json.salt }}");
+  discoverySensor("battery", "BlueConnect Battery", "battery", "%", "{{ value_json.battery }}");
+  discoverySensor("battery_voltage", "BlueConnect Battery Voltage", "voltage", "V", "{{ value_json.battery_voltage }}");
   discoverySensor("rssi", "BlueConnect RSSI", "signal_strength", "dBm", "{{ value_json.rssi }}");
   discoverySensor("battery_raw", "BlueConnect Battery Raw", "", "mV", "{{ value_json.battery_raw }}", "");
   discoverySensor("conductivity_raw", "BlueConnect Conductivity Raw", "", "", "{{ value_json.conductivity_raw }}", "");
@@ -445,32 +618,56 @@ void publishDiscovery() {
 
 String htmlPage() {
   String s;
+  String operationState = currentOperationState();
   s += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  s += "<title>BlueConnect ESP32-C3</title><style>body{font-family:system-ui;margin:24px;max-width:900px} .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0} code{background:#f5f5f5;padding:2px 4px;border-radius:4px} button{padding:10px 14px;border-radius:8px;border:1px solid #999;background:white}</style></head><body>";
+  s += "<title>BlueConnect ESP32-C3</title><style>body{font-family:system-ui;margin:24px;max-width:900px} .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0} code{background:#f5f5f5;padding:2px 4px;border-radius:4px} button{padding:10px 14px;border-radius:8px;border:1px solid #999;background:white} .muted{color:#666;font-size:.9em}</style></head><body>";
   s += "<h1>BlueConnect ESP32-C3</h1>";
-  s += "<div class='card'><h2>Werte</h2>";
-  s += "Temperatur: <b>" + String(last.temperatureC, 2) + " °C</b><br>";
-  s += "pH: <b>" + String(last.ph, 2) + "</b><br>";
-  s += "ORP: <b>" + String(last.orpMv, 0) + " mV</b><br>";
-  s += "Freies Chlor: <b>" + String(last.chlorinePpm, 2) + " ppm</b><br>";
-  s += "Leitfähigkeit: <b>" + String(last.ecUsCm, 0) + " µS/cm</b><br>";
-  s += "Salz: <b>" + String(last.saltPpm, 0) + " ppm</b><br>";
-  s += "Batterie: <b>" + String(last.batteryPercent, 0) + " %</b><br>";
-  s += "Batteriespannung: <b>" + String(last.batteryVoltage, 2) + " V</b><br>";
-  s += "Battery raw: <b>" + String(last.batteryRaw) + " mV</b><br>";
-  s += "Conductivity raw: <b>" + String(last.conductivityRaw) + "</b><br>";
-  s += "Status raw: <b>" + String(last.statusRaw) + "</b><br>";
-  s += "RSSI: <b>" + String(last.rssi) + " dBm</b><br>";
-  s += "Raw: <code>" + last.rawHex + "</code></div>";
+  s += "<div class='card'><h2>Measurements</h2>";
+  s += "Temperature: <b><span id='temperature'>" + String(last.temperatureC, 2) + "</span> &deg;C</b><br>";
+  s += "pH: <b><span id='ph'>" + String(last.ph, 2) + "</span></b><br>";
+  s += "ORP: <b><span id='orp'>" + String(last.orpMv, 0) + "</span> mV</b><br>";
+  s += "Free chlorine: <b><span id='chlorine'>" + String(last.chlorinePpm, 2) + "</span> ppm</b><br>";
+  s += "Conductivity: <b><span id='ec'>" + String(last.ecUsCm, 0) + "</span> &micro;S/cm</b><br>";
+  s += "Salt: <b><span id='salt'>" + String(last.saltPpm, 0) + "</span> ppm</b><br>";
+  s += "Battery: <b><span id='battery'>" + String(last.batteryPercent, 0) + "</span> %</b><br>";
+  s += "Battery voltage: <b><span id='battery_voltage'>" + String(last.batteryVoltage, 2) + "</span> V</b><br>";
+  s += "Battery raw: <b><span id='battery_raw'>" + String(last.batteryRaw) + "</span> mV</b><br>";
+  s += "Conductivity raw: <b><span id='conductivity_raw'>" + String(last.conductivityRaw) + "</span></b><br>";
+  s += "Status raw: <b><span id='status_raw'>" + String(last.statusRaw) + "</span></b><br>";
+  s += "RSSI: <b><span id='rssi'>" + String(last.rssi) + "</span> dBm</b><br>";
+  s += "Raw: <code id='raw_hex'>" + last.rawHex + "</code></div>";
   s += "<div class='card'><h2>Status</h2>";
-  s += "MAC: <code>" + last.mac + "</code><br>";
-  s += "Fehler: <code>" + last.lastError + "</code><br>";
-  s += "Letzte Advertisement: <code>" + lastAdvertisement + "</code><br>";
-  s += "Heap: " + String(ESP.getFreeHeap()) + " Bytes<br>";
-  s += "WLAN RSSI: " + String(WiFi.RSSI()) + " dBm<br>";
-  s += "Uptime: " + String(millis()/1000) + " s</div>";
-  s += "<div class='card'><form action='/measure' method='post'><button>Jetzt messen</button></form> ";
-  s += "<p>JSON: <a href='/api/state'>/api/state</a> · Diagnose: <a href='/api/diagnostics'>/api/diagnostics</a></p></div>";
+  s += "Operation: <b id='operation'>" + operationState + "</b><br>";
+  s += "Target MAC: <code id='target_mac'>" + String(BLUECONNECT_MAC) + "</code><br>";
+  s += "MAC: <code id='mac'>" + last.mac + "</code><br>";
+  s += "Last error: <code id='last_error'>" + last.lastError + "</code><br>";
+  s += "Last advertisement: <code id='last_advertisement'>" + lastAdvertisement + "</code><br>";
+  s += "Advertisements seen: <span id='scan_seen_count'>" + String(scanAdvertisementCount) + "</span><br>";
+  s += "Heap: <span id='free_heap'>" + String(ESP.getFreeHeap()) + "</span> Bytes<br>";
+  s += "Wi-Fi RSSI: <span id='wifi_rssi'>" + String(WiFi.RSSI()) + "</span> dBm<br>";
+  s += "Uptime: <span id='uptime_s'>" + String(millis()/1000) + "</span> s<br>";
+  s += "<span class='muted'>Live refresh: <span id='live_status'>starting</span></span></div>";
+  s += "<div class='card'><h2>Scan Results</h2><pre id='scan_results' style='white-space:pre-wrap;margin:0'>" + htmlEscape(scanResultsText()) + "</pre></div>";
+  s += "<div class='card'><form id='measure_form' action='/measure' method='post' style='display:inline-block;margin-right:8px'><button>Measure now</button></form>";
+  s += "<form id='scan_form' action='/scan' method='post' style='display:inline-block'><button>Scan</button></form> ";
+  s += "<p>JSON: <a href='/api/state'>/api/state</a> &middot; Diagnostics: <a href='/api/diagnostics'>/api/diagnostics</a></p></div>";
+  s += "<script>";
+  s += "const $=id=>document.getElementById(id);";
+  s += "function set(id,v){const e=$(id);if(e)e.textContent=v;}";
+  s += "function fmt(v,d){return typeof v==='number'&&isFinite(v)?v.toFixed(d):'nan';}";
+  s += "function val(v,f){return v==null?f:v;}";
+  s += "async function postAction(url){set('live_status','sending');try{await fetch(url,{method:'POST'});await refresh();}catch(e){set('live_status','offline');}}";
+  s += "async function refresh(){try{const st=await fetch('/api/state',{cache:'no-store'}).then(r=>r.json());const dg=await fetch('/api/diagnostics',{cache:'no-store'}).then(r=>r.json());";
+  s += "set('temperature',fmt(st.temperature,2));set('ph',fmt(st.ph,2));set('orp',fmt(st.orp,0));set('chlorine',fmt(st.chlorine,2));set('ec',fmt(st.ec,0));set('salt',fmt(st.salt,0));";
+  s += "set('battery',fmt(st.battery,0));set('battery_voltage',fmt(st.battery_voltage,2));set('battery_raw',val(st.battery_raw,0));set('conductivity_raw',val(st.conductivity_raw,0));set('status_raw',val(st.status_raw,0));";
+  s += "set('rssi',val(st.rssi,0));set('raw_hex',st.raw_hex||'');set('operation',st.operation||dg.operation||'idle');set('mac',st.mac||'');set('last_error',st.last_error||dg.last_error||'');";
+  s += "set('target_mac',dg.target_mac||'');set('last_advertisement',dg.last_advertisement||'');set('scan_seen_count',val(dg.scan_seen_count,0));set('scan_results',(dg.scan_results&&dg.scan_results.length)?dg.scan_results.join('\\n'):'No advertisements seen yet');";
+  s += "set('free_heap',val(dg.free_heap,''));set('wifi_rssi',val(dg.wifi_rssi,''));set('uptime_s',val(dg.uptime_s,''));set('live_status','ok');";
+  s += "}catch(e){set('live_status','offline');}}";
+  s += "$('measure_form').addEventListener('submit',e=>{e.preventDefault();postAction('/measure');});";
+  s += "$('scan_form').addEventListener('submit',e=>{e.preventDefault();postAction('/scan');});";
+  s += "refresh();setInterval(refresh,2000);";
+  s += "</script>";
   s += "</body></html>";
   return s;
 }
@@ -478,10 +675,20 @@ String htmlPage() {
 void setupWeb() {
   server.on("/", HTTP_GET, [](){ server.send(200, "text/html", htmlPage()); });
   server.on("/measure", HTTP_POST, [](){
-    bool ok = scanAndReadBlueConnect();
-    lastReadOk = ok;
+    if (!measurementInProgress) {
+      measurementRequested = true;
+    }
     server.sendHeader("Location", "/");
-    server.send(ok ? 303 : 503, "text/plain", ok ? "ok" : last.lastError);
+    server.send(303, "text/plain", measurementInProgress ? "measurement already running" : "measurement queued");
+  });
+  server.on("/scan", HTTP_POST, [](){
+    if (!measurementInProgress && !scanOnlyInProgress) {
+      scanRequested = true;
+      last.lastError = "scan queued";
+      Serial.println("[WEB] Scan queued");
+    }
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", (measurementInProgress || scanOnlyInProgress) ? "operation already running" : "scan queued");
   });
   server.on("/api/state", HTTP_GET, [](){
     JsonDocument doc;
@@ -502,16 +709,24 @@ void setupWeb() {
     doc["mac"] = last.mac;
     doc["raw_hex"] = last.rawHex;
     doc["last_error"] = last.lastError;
+    doc["operation"] = currentOperationState();
     String out; serializeJsonPretty(doc, out);
     server.send(200, "application/json", out);
   });
   server.on("/api/diagnostics", HTTP_GET, [](){
     JsonDocument doc;
     doc["last_advertisement"] = lastAdvertisement;
+    doc["target_mac"] = BLUECONNECT_MAC;
+    doc["scan_seen_count"] = scanAdvertisementCount;
+    JsonArray scanResults = doc["scan_results"].to<JsonArray>();
+    for (uint8_t i = 0; i < scanResultCount; i++) {
+      scanResults.add(scanResultLines[i]);
+    }
     doc["free_heap"] = ESP.getFreeHeap();
     doc["uptime_s"] = millis()/1000;
     doc["wifi_rssi"] = WiFi.RSSI();
     doc["last_error"] = last.lastError;
+    doc["operation"] = currentOperationState();
     String out; serializeJsonPretty(doc, out);
     server.send(200, "application/json", out);
   });
@@ -524,6 +739,7 @@ void setup() {
   Serial.println("\nBlueConnect Go ESP32-C3 MQTT Bridge");
 
   connectWifi();
+  setupOta();
   mqtt.setBufferSize(1024);
   ensureMqtt();
   setupWeb();
@@ -540,11 +756,17 @@ void loop() {
     connectWifi();
   }
   ensureMqtt();
-  mqtt.loop();
-  server.handleClient();
+  handleBackground();
 
   const uint32_t intervalMs = lastReadOk ? MEASURE_INTERVAL_MS : MEASURE_RETRY_INTERVAL_MS;
-  if (lastAttemptMs == 0 || millis() - lastAttemptMs >= intervalMs) {
+  const bool scheduledMeasurementDue = lastAttemptMs == 0 || millis() - lastAttemptMs >= intervalMs;
+  if (!measurementInProgress && !scanOnlyInProgress && measurementRequested) {
+    measurementRequested = false;
+    lastReadOk = scanAndReadBlueConnect();
+  } else if (!measurementInProgress && !scanOnlyInProgress && scanRequested) {
+    scanRequested = false;
+    scanBlueConnectOnly();
+  } else if (!measurementInProgress && !scanOnlyInProgress && scheduledMeasurementDue) {
     lastReadOk = scanAndReadBlueConnect();
   }
 
