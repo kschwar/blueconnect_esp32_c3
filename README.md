@@ -65,6 +65,14 @@ The project uses PlatformIO and pins the BLE stack to `h2zero/NimBLE-Arduino@1.4
 
 NimBLE-Arduino 2.x changes parts of the scan and connection behavior. This firmware currently targets 1.4.3 because it has been more reliable with the tested Blue Connect Go device.
 
+BLE is also configured for reliability over power saving:
+
+- BLE TX power is set to `ESP_PWR_LVL_P9`
+- the BLE scan window is set equal to the scan interval for continuous scanning during the scan period
+- the scan period is `20` seconds
+
+Wi-Fi power-save and TX-power overrides are intentionally not enabled by default. On the tested ESP32-C3/Arduino/NimBLE combination those overrides can interfere with Bluetooth/Wi-Fi coexistence during BLE startup.
+
 ## Upload
 
 The first upload must be done over USB so the OTA-enabled firmware is installed:
@@ -121,7 +129,9 @@ Main timing values are defined in `src/main.cpp`:
 ```cpp
 MEASURE_INTERVAL_MS        // 15 minutes after a successful read
 MEASURE_RETRY_INTERVAL_MS  // 1 minute after a failed read
-BLE_SCAN_SECONDS           // scan window
+BLE_SCAN_SECONDS           // scan window, 20 seconds by default
+BLE_SCAN_INTERVAL_MS       // BLE scan interval
+BLE_SCAN_WINDOW_MS         // BLE scan window, same as interval for continuous scanning
 BLE_NOTIFY_TIMEOUT_MS      // wait time for BLE notification
 ```
 
@@ -177,6 +187,8 @@ homeassistant/sensor/blueconnect_go_esp32c3/...
 
 After the first successful MQTT connection, Home Assistant should create sensor entities for temperature, pH, ORP, chlorine, EC, salt, battery, battery voltage, RSSI, and raw diagnostic values.
 
+The pH sensor is published with `device_class: ph` and no unit of measurement. Home Assistant treats pH as unitless, so adding `pH` as `unit_of_measurement` can make the MQTT discovery entry invalid or leave the entity unavailable.
+
 ## Web Interface
 
 Open:
@@ -196,6 +208,8 @@ Available endpoints:
 - `/api/diagnostics` diagnostic JSON
 
 The web UI polls the JSON endpoints every 2 seconds, so measurements, scan state, RSSI, BLE scan results, and diagnostics update without reloading the page.
+
+Wi-Fi RSSI, BLE TX power, and BLE scan settings are shown in the status section and in `/api/diagnostics`.
 
 The `Scan Results` section lists recently seen BLE advertisements from the last scan. Entries include MAC address, RSSI, advertised name, and whether the expected Blue Connect service UUID was present in that advertisement. Some Blue Connect advertisements do not expose the service UUID, so a fixed `BLUECONNECT_MAC_VALUE` is recommended.
 

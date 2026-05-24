@@ -54,9 +54,12 @@ static const char* HOSTNAME    = "blueconnect-c3";
 
 static const uint32_t MEASURE_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 minutes
 static const uint32_t MEASURE_RETRY_INTERVAL_MS = 60UL * 1000UL;  // 1 minute after failure
-static const uint32_t BLE_SCAN_SECONDS    = 12;
+static const uint32_t BLE_SCAN_SECONDS    = 20;
+static const uint16_t BLE_SCAN_INTERVAL_MS = 80;
+static const uint16_t BLE_SCAN_WINDOW_MS   = 80;
 static const uint32_t BLE_NOTIFY_TIMEOUT_MS = 35000;
 static const bool ENABLE_DIAGNOSTICS = true;
+static const esp_power_level_t BLE_TX_POWER = ESP_PWR_LVL_P9;
 
 // ================================================================
 // BlueConnect BLE UUIDs
@@ -196,6 +199,10 @@ String scanResultsText() {
   return out;
 }
 
+String bleTxPowerText() {
+  return "+9 dBm";
+}
+
 uint16_t readLe16(const uint8_t* data, size_t offset) {
   return (uint16_t)data[offset] | ((uint16_t)data[offset + 1] << 8);
 }
@@ -315,8 +322,8 @@ bool scanBlueConnectOnly() {
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&advertisedCallbacks, true);
   scan->setActiveScan(true);
-  scan->setInterval(80);
-  scan->setWindow(40);
+  scan->setInterval(BLE_SCAN_INTERVAL_MS);
+  scan->setWindow(BLE_SCAN_WINDOW_MS);
 
   Serial.println("[BLE] Manual scan start");
   lastScanMs = millis();
@@ -355,8 +362,8 @@ bool scanAndReadBlueConnect() {
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&advertisedCallbacks, true);
   scan->setActiveScan(true);
-  scan->setInterval(80);
-  scan->setWindow(40);
+  scan->setInterval(BLE_SCAN_INTERVAL_MS);
+  scan->setWindow(BLE_SCAN_WINDOW_MS);
 
   Serial.println("[BLE] Scan start");
   lastScanMs = millis();
@@ -576,6 +583,10 @@ void publishDiagnostics(const char* reason) {
   doc["free_heap"] = ESP.getFreeHeap();
   doc["uptime_s"] = millis() / 1000;
   doc["wifi_rssi"] = WiFi.RSSI();
+  doc["ble_tx_power"] = bleTxPowerText();
+  doc["ble_scan_seconds"] = BLE_SCAN_SECONDS;
+  doc["ble_scan_interval_ms"] = BLE_SCAN_INTERVAL_MS;
+  doc["ble_scan_window_ms"] = BLE_SCAN_WINDOW_MS;
   doc["blue_rssi"] = last.rssi;
   doc["mac"] = last.mac;
   publishJson(TOPIC_DIAG, doc, true);
@@ -604,7 +615,7 @@ void discoverySensor(const char* objectId, const char* name, const char* deviceC
 
 void publishDiscovery() {
   discoverySensor("temperature", "Pool Temperature", "temperature", "°C", "{{ value_json.temperature }}");
-  discoverySensor("ph", "Pool pH", "ph", "pH", "{{ value_json.ph }}");
+  discoverySensor("ph", "Pool pH", "ph", "", "{{ value_json.ph }}");
   discoverySensor("orp", "Pool ORP", "voltage", "mV", "{{ value_json.orp }}");
   discoverySensor("chlorine", "Pool Free Chlorine", "", "ppm", "{{ value_json.chlorine }}");
   discoverySensor("ec", "Pool Conductivity", "", "µS/cm", "{{ value_json.ec }}");
@@ -645,6 +656,8 @@ String htmlPage() {
   s += "Advertisements seen: <span id='scan_seen_count'>" + String(scanAdvertisementCount) + "</span><br>";
   s += "Heap: <span id='free_heap'>" + String(ESP.getFreeHeap()) + "</span> Bytes<br>";
   s += "Wi-Fi RSSI: <span id='wifi_rssi'>" + String(WiFi.RSSI()) + "</span> dBm<br>";
+  s += "BLE TX power: <span id='ble_tx_power'>" + bleTxPowerText() + "</span><br>";
+  s += "BLE scan: <span id='ble_scan_config'>" + String(BLE_SCAN_SECONDS) + " s, " + String(BLE_SCAN_WINDOW_MS) + "/" + String(BLE_SCAN_INTERVAL_MS) + " ms</span><br>";
   s += "Uptime: <span id='uptime_s'>" + String(millis()/1000) + "</span> s<br>";
   s += "<span class='muted'>Live refresh: <span id='live_status'>starting</span></span></div>";
   s += "<div class='card'><h2>Scan Results</h2><pre id='scan_results' style='white-space:pre-wrap;margin:0'>" + htmlEscape(scanResultsText()) + "</pre></div>";
@@ -662,7 +675,9 @@ String htmlPage() {
   s += "set('battery',fmt(st.battery,0));set('battery_voltage',fmt(st.battery_voltage,2));set('battery_raw',val(st.battery_raw,0));set('conductivity_raw',val(st.conductivity_raw,0));set('status_raw',val(st.status_raw,0));";
   s += "set('rssi',val(st.rssi,0));set('raw_hex',st.raw_hex||'');set('operation',st.operation||dg.operation||'idle');set('mac',st.mac||'');set('last_error',st.last_error||dg.last_error||'');";
   s += "set('target_mac',dg.target_mac||'');set('last_advertisement',dg.last_advertisement||'');set('scan_seen_count',val(dg.scan_seen_count,0));set('scan_results',(dg.scan_results&&dg.scan_results.length)?dg.scan_results.join('\\n'):'No advertisements seen yet');";
-  s += "set('free_heap',val(dg.free_heap,''));set('wifi_rssi',val(dg.wifi_rssi,''));set('uptime_s',val(dg.uptime_s,''));set('live_status','ok');";
+  s += "set('free_heap',val(dg.free_heap,''));set('wifi_rssi',val(dg.wifi_rssi,''));";
+  s += "set('ble_tx_power',dg.ble_tx_power||'');set('ble_scan_config',val(dg.ble_scan_seconds,'')+' s, '+val(dg.ble_scan_window_ms,'')+'/'+val(dg.ble_scan_interval_ms,'')+' ms');";
+  s += "set('uptime_s',val(dg.uptime_s,''));set('live_status','ok');";
   s += "}catch(e){set('live_status','offline');}}";
   s += "$('measure_form').addEventListener('submit',e=>{e.preventDefault();postAction('/measure');});";
   s += "$('scan_form').addEventListener('submit',e=>{e.preventDefault();postAction('/scan');});";
@@ -725,6 +740,10 @@ void setupWeb() {
     doc["free_heap"] = ESP.getFreeHeap();
     doc["uptime_s"] = millis()/1000;
     doc["wifi_rssi"] = WiFi.RSSI();
+    doc["ble_tx_power"] = bleTxPowerText();
+    doc["ble_scan_seconds"] = BLE_SCAN_SECONDS;
+    doc["ble_scan_interval_ms"] = BLE_SCAN_INTERVAL_MS;
+    doc["ble_scan_window_ms"] = BLE_SCAN_WINDOW_MS;
     doc["last_error"] = last.lastError;
     doc["operation"] = currentOperationState();
     String out; serializeJsonPretty(doc, out);
@@ -745,7 +764,7 @@ void setup() {
   setupWeb();
 
   NimBLEDevice::init("BlueConnect-C3");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setPower(BLE_TX_POWER);
 
   publishDiagnostics("boot");
   lastReadOk = scanAndReadBlueConnect();
