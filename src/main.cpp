@@ -32,6 +32,15 @@
 #ifndef BLUECONNECT_MAC_VALUE
 #define BLUECONNECT_MAC_VALUE ""
 #endif
+#ifndef PH_CENTER_VALUE
+#define PH_CENTER_VALUE 2048.0f
+#endif
+#ifndef PH_SCALE_VALUE
+#define PH_SCALE_VALUE 235.0f
+#endif
+#ifndef PH_OFFSET_VALUE
+#define PH_OFFSET_VALUE 6.92f
+#endif
 
 // ================================================================
 // User configuration
@@ -60,6 +69,9 @@ static const uint16_t BLE_SCAN_WINDOW_MS   = 80;
 static const uint32_t BLE_NOTIFY_TIMEOUT_MS = 35000;
 static const bool ENABLE_DIAGNOSTICS = true;
 static const esp_power_level_t BLE_TX_POWER = ESP_PWR_LVL_P9;
+static const float PH_CENTER = PH_CENTER_VALUE;
+static const float PH_SCALE = PH_SCALE_VALUE;
+static const float PH_OFFSET = PH_OFFSET_VALUE;
 
 // ================================================================
 // BlueConnect BLE UUIDs
@@ -89,6 +101,7 @@ struct Measurement {
   float saltPpm = NAN;
   float batteryVoltage = NAN;
   float batteryPercent = NAN;
+  uint16_t phRaw = 0;
   uint16_t batteryRaw = 0;
   uint16_t conductivityRaw = 0;
   int statusRaw = 0;
@@ -229,7 +242,7 @@ bool parseBluePayload(const uint8_t* data, size_t len, Measurement& m) {
   const uint16_t rawBatt = readLe16(data, 9);
 
   const float tempC = rawTemp / 100.0f + 0.1f;
-  const float ph = (2048.0f - rawPh) / 235.0f + 6.92f;
+  const float ph = (PH_CENTER - rawPh) / PH_SCALE + PH_OFFSET;
   const float orpMv = rawOrp / 4.0f - 5.0f;
   const float baseChlorine = max(0.0f, (orpMv - 650.0f) / 150.0f);
   const float phFactor = powf(10.0f, 7.5f - ph);
@@ -241,6 +254,7 @@ bool parseBluePayload(const uint8_t* data, size_t len, Measurement& m) {
   m.ph = ph;
   m.orpMv = orpMv;
   m.chlorinePpm = chlorinePpm;
+  m.phRaw = rawPh;
   m.conductivityRaw = rawCond;
   if (rawCond != 0) {
     const float ec25 = rawCond / (1.0f + 0.02f * (tempC - 25.0f));
@@ -558,6 +572,7 @@ void publishState() {
   else doc["salt"] = nullptr;
   doc["battery"] = serialized(String(last.batteryPercent, 0));
   doc["battery_voltage"] = serialized(String(last.batteryVoltage, 2));
+  doc["ph_raw"] = last.phRaw;
   doc["battery_raw"] = last.batteryRaw;
   doc["conductivity_raw"] = last.conductivityRaw;
   doc["status_raw"] = last.statusRaw;
@@ -587,6 +602,9 @@ void publishDiagnostics(const char* reason) {
   doc["ble_scan_seconds"] = BLE_SCAN_SECONDS;
   doc["ble_scan_interval_ms"] = BLE_SCAN_INTERVAL_MS;
   doc["ble_scan_window_ms"] = BLE_SCAN_WINDOW_MS;
+  doc["ph_center"] = PH_CENTER;
+  doc["ph_scale"] = PH_SCALE;
+  doc["ph_offset"] = PH_OFFSET;
   doc["blue_rssi"] = last.rssi;
   doc["mac"] = last.mac;
   publishJson(TOPIC_DIAG, doc, true);
@@ -623,6 +641,7 @@ void publishDiscovery() {
   discoverySensor("battery", "BlueConnect Battery", "battery", "%", "{{ value_json.battery }}");
   discoverySensor("battery_voltage", "BlueConnect Battery Voltage", "voltage", "V", "{{ value_json.battery_voltage }}");
   discoverySensor("rssi", "BlueConnect RSSI", "signal_strength", "dBm", "{{ value_json.rssi }}");
+  discoverySensor("ph_raw", "BlueConnect pH Raw", "", "", "{{ value_json.ph_raw }}", "");
   discoverySensor("battery_raw", "BlueConnect Battery Raw", "", "mV", "{{ value_json.battery_raw }}", "");
   discoverySensor("conductivity_raw", "BlueConnect Conductivity Raw", "", "", "{{ value_json.conductivity_raw }}", "");
 }
@@ -642,6 +661,7 @@ String htmlPage() {
   s += "Salt: <b><span id='salt'>" + String(last.saltPpm, 0) + "</span> ppm</b><br>";
   s += "Battery: <b><span id='battery'>" + String(last.batteryPercent, 0) + "</span> %</b><br>";
   s += "Battery voltage: <b><span id='battery_voltage'>" + String(last.batteryVoltage, 2) + "</span> V</b><br>";
+  s += "pH raw: <b><span id='ph_raw'>" + String(last.phRaw) + "</span></b><br>";
   s += "Battery raw: <b><span id='battery_raw'>" + String(last.batteryRaw) + "</span> mV</b><br>";
   s += "Conductivity raw: <b><span id='conductivity_raw'>" + String(last.conductivityRaw) + "</span></b><br>";
   s += "Status raw: <b><span id='status_raw'>" + String(last.statusRaw) + "</span></b><br>";
@@ -658,6 +678,7 @@ String htmlPage() {
   s += "Wi-Fi RSSI: <span id='wifi_rssi'>" + String(WiFi.RSSI()) + "</span> dBm<br>";
   s += "BLE TX power: <span id='ble_tx_power'>" + bleTxPowerText() + "</span><br>";
   s += "BLE scan: <span id='ble_scan_config'>" + String(BLE_SCAN_SECONDS) + " s, " + String(BLE_SCAN_WINDOW_MS) + "/" + String(BLE_SCAN_INTERVAL_MS) + " ms</span><br>";
+  s += "pH calibration: <span id='ph_calibration'>" + String(PH_CENTER, 2) + " / " + String(PH_SCALE, 2) + " / " + String(PH_OFFSET, 2) + "</span><br>";
   s += "Uptime: <span id='uptime_s'>" + String(millis()/1000) + "</span> s<br>";
   s += "<span class='muted'>Live refresh: <span id='live_status'>starting</span></span></div>";
   s += "<div class='card'><h2>Scan Results</h2><pre id='scan_results' style='white-space:pre-wrap;margin:0'>" + htmlEscape(scanResultsText()) + "</pre></div>";
@@ -672,11 +693,12 @@ String htmlPage() {
   s += "async function postAction(url){set('live_status','sending');try{await fetch(url,{method:'POST'});await refresh();}catch(e){set('live_status','offline');}}";
   s += "async function refresh(){try{const st=await fetch('/api/state',{cache:'no-store'}).then(r=>r.json());const dg=await fetch('/api/diagnostics',{cache:'no-store'}).then(r=>r.json());";
   s += "set('temperature',fmt(st.temperature,2));set('ph',fmt(st.ph,2));set('orp',fmt(st.orp,0));set('chlorine',fmt(st.chlorine,2));set('ec',fmt(st.ec,0));set('salt',fmt(st.salt,0));";
-  s += "set('battery',fmt(st.battery,0));set('battery_voltage',fmt(st.battery_voltage,2));set('battery_raw',val(st.battery_raw,0));set('conductivity_raw',val(st.conductivity_raw,0));set('status_raw',val(st.status_raw,0));";
+  s += "set('battery',fmt(st.battery,0));set('battery_voltage',fmt(st.battery_voltage,2));set('ph_raw',val(st.ph_raw,0));set('battery_raw',val(st.battery_raw,0));set('conductivity_raw',val(st.conductivity_raw,0));set('status_raw',val(st.status_raw,0));";
   s += "set('rssi',val(st.rssi,0));set('raw_hex',st.raw_hex||'');set('operation',st.operation||dg.operation||'idle');set('mac',st.mac||'');set('last_error',st.last_error||dg.last_error||'');";
   s += "set('target_mac',dg.target_mac||'');set('last_advertisement',dg.last_advertisement||'');set('scan_seen_count',val(dg.scan_seen_count,0));set('scan_results',(dg.scan_results&&dg.scan_results.length)?dg.scan_results.join('\\n'):'No advertisements seen yet');";
   s += "set('free_heap',val(dg.free_heap,''));set('wifi_rssi',val(dg.wifi_rssi,''));";
   s += "set('ble_tx_power',dg.ble_tx_power||'');set('ble_scan_config',val(dg.ble_scan_seconds,'')+' s, '+val(dg.ble_scan_window_ms,'')+'/'+val(dg.ble_scan_interval_ms,'')+' ms');";
+  s += "set('ph_calibration',fmt(dg.ph_center,2)+' / '+fmt(dg.ph_scale,2)+' / '+fmt(dg.ph_offset,2));";
   s += "set('uptime_s',val(dg.uptime_s,''));set('live_status','ok');";
   s += "}catch(e){set('live_status','offline');}}";
   s += "$('measure_form').addEventListener('submit',e=>{e.preventDefault();postAction('/measure');});";
@@ -717,6 +739,7 @@ void setupWeb() {
     else doc["salt"] = nullptr;
     doc["battery"] = last.batteryPercent;
     doc["battery_voltage"] = last.batteryVoltage;
+    doc["ph_raw"] = last.phRaw;
     doc["battery_raw"] = last.batteryRaw;
     doc["conductivity_raw"] = last.conductivityRaw;
     doc["status_raw"] = last.statusRaw;
@@ -744,6 +767,9 @@ void setupWeb() {
     doc["ble_scan_seconds"] = BLE_SCAN_SECONDS;
     doc["ble_scan_interval_ms"] = BLE_SCAN_INTERVAL_MS;
     doc["ble_scan_window_ms"] = BLE_SCAN_WINDOW_MS;
+    doc["ph_center"] = PH_CENTER;
+    doc["ph_scale"] = PH_SCALE;
+    doc["ph_offset"] = PH_OFFSET;
     doc["last_error"] = last.lastError;
     doc["operation"] = currentOperationState();
     String out; serializeJsonPretty(doc, out);

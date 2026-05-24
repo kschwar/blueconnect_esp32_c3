@@ -8,3 +8,9 @@
 #define MQTT_USER_VALUE ""
 #define MQTT_PASS_VALUE ""
 #define BLUECONNECT_MAC_VALUE "" // 00:A0:50:XX:XX:XX
+
+// Optional pH calibration. Defaults match the fsedarkalex BlueConnect decoder:
+// pH = (PH_CENTER_VALUE - raw_pH) / PH_SCALE_VALUE + PH_OFFSET_VALUE
+#define PH_CENTER_VALUE 2048.0f
+#define PH_SCALE_VALUE 235.0f
+#define PH_OFFSET_VALUE 6.92f

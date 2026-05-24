@@ -120,9 +120,24 @@ Create `include/secrets.h` from `include/secrets_example.h`:
 #define MQTT_USER_VALUE ""
 #define MQTT_PASS_VALUE ""
 #define BLUECONNECT_MAC_VALUE ""
+#define PH_CENTER_VALUE 2048.0f
+#define PH_SCALE_VALUE 235.0f
+#define PH_OFFSET_VALUE 6.92f
 ```
 
 `BLUECONNECT_MAC_VALUE` can be left empty to search by BLE service UUID. For more reliable operation, set the fixed MAC address of your Blue Connect Go.
+
+The pH value is calculated from the raw BLE sensor value:
+
+```cpp
+pH = (PH_CENTER_VALUE - raw_pH) / PH_SCALE_VALUE + PH_OFFSET_VALUE
+```
+
+The defaults match the fsedarkalex BlueConnect decoder. The firmware also publishes `ph_raw`, so the pH calculation can be compared with the official app. For a simple offset correction, read both values from the same measurement and adjust:
+
+```text
+new PH_OFFSET_VALUE = current PH_OFFSET_VALUE + official_app_pH - esp_pH
+```
 
 Main timing values are defined in `src/main.cpp`:
 
@@ -167,6 +182,7 @@ Example state payload:
   "salt": null,
   "battery": 92,
   "battery_voltage": 3.62,
+  "ph_raw": 1848,
   "battery_raw": 3620,
   "conductivity_raw": 0,
   "rssi": -66,
