@@ -170,6 +170,14 @@ Diagnostics:
 blueconnect/go/diagnostics
 ```
 
+Commands:
+
+```text
+blueconnect/go/measure/set  # payload: PRESS
+blueconnect/go/scan/set     # payload: PRESS
+blueconnect/go/reboot/set   # payload: PRESS
+```
+
 Example state payload:
 
 ```json
@@ -186,6 +194,7 @@ Example state payload:
   "battery_raw": 3620,
   "conductivity_raw": 0,
   "rssi": -66,
+  "wifi_rssi": -81,
   "mac": "AA:BB:CC:DD:EE:FF",
   "raw_hex": "33140A5607750800001E0E1D",
   "last_error": "ok",
@@ -201,7 +210,15 @@ The firmware publishes MQTT Discovery config under:
 homeassistant/sensor/blueconnect_go_esp32c3/...
 ```
 
-After the first successful MQTT connection, Home Assistant should create sensor entities for temperature, pH, ORP, chlorine, EC, salt, battery, battery voltage, RSSI, and raw diagnostic values.
+After the first successful MQTT connection, Home Assistant should create sensor entities for temperature, pH, ORP, chlorine, EC, salt, battery, battery voltage, BlueConnect BLE RSSI, ESP32 Wi-Fi RSSI, and raw diagnostic values.
+
+Home Assistant should also create three MQTT buttons:
+
+- `BlueConnect Measure Now` publishes `PRESS` to `blueconnect/go/measure/set`
+- `BlueConnect BLE Scan` publishes `PRESS` to `blueconnect/go/scan/set`
+- `BlueConnect Reboot` publishes `PRESS` to `blueconnect/go/reboot/set`
+
+On startup the firmware publishes availability and discovery first. It does not publish measurement values until a valid BLE read completed. If no valid measurement exists yet, the retained state topic is cleared so Home Assistant does not receive stale `nan` values from an earlier boot or firmware version.
 
 The pH sensor is published with `device_class: ph` and no unit of measurement. Home Assistant treats pH as unitless, so adding `pH` as `unit_of_measurement` can make the MQTT discovery entry invalid or leave the entity unavailable.
 

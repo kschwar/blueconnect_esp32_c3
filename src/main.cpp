@@ -86,6 +86,9 @@ static NimBLEUUID BLUE_NOTIFY_UUID ("F3300003-F0A2-9B06-0C59-1BC4763B5C00");
 static const char* TOPIC_STATE = "blueconnect/go/state";
 static const char* TOPIC_AVAIL = "blueconnect/go/availability";
 static const char* TOPIC_DIAG  = "blueconnect/go/diagnostics";
+static const char* TOPIC_CMD_MEASURE = "blueconnect/go/measure/set";
+static const char* TOPIC_CMD_SCAN = "blueconnect/go/scan/set";
+static const char* TOPIC_CMD_REBOOT = "blueconnect/go/reboot/set";
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -126,10 +129,12 @@ uint32_t lastScanMs = 0;
 uint32_t lastAttemptMs = 0;
 uint32_t lastMqttAttemptMs = 0;
 bool lastReadOk = false;
+bool retainedStateCleared = false;
 bool measurementRequested = false;
 bool measurementInProgress = false;
 bool scanRequested = false;
 bool scanOnlyInProgress = false;
+bool rebootRequested = false;
 bool targetSeen = false;
 
 String bytesToHex(const uint8_t* data, size_t len) {
@@ -317,6 +322,8 @@ void handleBackground();
 void publishDiscovery();
 void publishState();
 void publishDiagnostics(const char* reason);
+void mqttCallback(char* topic, uint8_t* payload, unsigned int length);
+void clearRetainedState();
 
 String currentOperationState() {
   if (measurementInProgress) return "measuring";
@@ -538,6 +545,7 @@ void ensureMqtt() {
   lastMqttAttemptMs = millis();
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
 
   Serial.printf("[MQTT] Connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
   bool ok;
@@ -547,9 +555,52 @@ void ensureMqtt() {
   if (ok) {
     Serial.println("[MQTT] Connected");
     mqtt.publish(TOPIC_AVAIL, "online", true);
+    mqtt.subscribe(TOPIC_CMD_MEASURE);
+    mqtt.subscribe(TOPIC_CMD_SCAN);
+    mqtt.subscribe(TOPIC_CMD_REBOOT);
     publishDiscovery();
+    if (last.valid) {
+      publishState();
+    } else {
+      clearRetainedState();
+    }
   } else {
     Serial.printf("[MQTT] failed rc=%d\n", mqtt.state());
+  }
+}
+
+void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+  String message;
+  message.reserve(length);
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  message.trim();
+
+  const bool isPress = length == 0 || message.equalsIgnoreCase("PRESS") ||
+                       message.equalsIgnoreCase("ON") || message == "1" ||
+                       message.equalsIgnoreCase("true");
+  if (!isPress) {
+    Serial.printf("[MQTT] Ignoring command topic=%s payload=%s\n", topic, message.c_str());
+    return;
+  }
+
+  if (strcmp(topic, TOPIC_CMD_MEASURE) == 0) {
+    if (!measurementInProgress && !scanOnlyInProgress) {
+      measurementRequested = true;
+      last.lastError = "measure queued by mqtt";
+      Serial.println("[MQTT] Measure queued");
+    }
+  } else if (strcmp(topic, TOPIC_CMD_SCAN) == 0) {
+    if (!measurementInProgress && !scanOnlyInProgress) {
+      scanRequested = true;
+      last.lastError = "scan queued by mqtt";
+      Serial.println("[MQTT] Scan queued");
+    }
+  } else if (strcmp(topic, TOPIC_CMD_REBOOT) == 0) {
+    rebootRequested = true;
+    last.lastError = "reboot queued by mqtt";
+    Serial.println("[MQTT] Reboot queued");
   }
 }
 
@@ -559,8 +610,22 @@ void publishJson(const char* topic, JsonDocument& doc, bool retained=false) {
   mqtt.publish(topic, (const uint8_t*)buf, n, retained);
 }
 
+void clearRetainedState() {
+  if (retainedStateCleared) return;
+  if (!mqtt.connected()) return;
+  mqtt.publish(TOPIC_STATE, "", true);
+  retainedStateCleared = true;
+  Serial.println("[MQTT] Cleared retained state until first valid measurement");
+}
+
 void publishState() {
   ensureMqtt();
+  if (!last.valid) {
+    clearRetainedState();
+    Serial.println("[MQTT] Skip state publish without valid measurement");
+    return;
+  }
+
   JsonDocument doc;
   doc["temperature"] = serialized(String(last.temperatureC, 2));
   doc["ph"] = serialized(String(last.ph, 2));
@@ -577,11 +642,13 @@ void publishState() {
   doc["conductivity_raw"] = last.conductivityRaw;
   doc["status_raw"] = last.statusRaw;
   doc["rssi"] = last.rssi;
+  doc["wifi_rssi"] = WiFi.RSSI();
   doc["mac"] = last.mac;
   doc["raw_hex"] = last.rawHex;
   doc["last_error"] = last.lastError;
   doc["uptime_s"] = millis() / 1000;
   publishJson(TOPIC_STATE, doc, true);
+  retainedStateCleared = true;
 }
 
 void publishDiagnostics(const char* reason) {
@@ -631,6 +698,24 @@ void discoverySensor(const char* objectId, const char* name, const char* deviceC
   publishJson(topic.c_str(), doc, true);
 }
 
+void discoveryButton(const char* objectId, const char* name, const char* commandTopic) {
+  JsonDocument doc;
+  String uniqueId = String(DEVICE_ID) + "_" + objectId;
+  doc["name"] = name;
+  doc["unique_id"] = uniqueId;
+  doc["command_topic"] = commandTopic;
+  doc["payload_press"] = "PRESS";
+  doc["availability_topic"] = TOPIC_AVAIL;
+  JsonObject dev = doc["device"].to<JsonObject>();
+  dev["identifiers"][0] = DEVICE_ID;
+  dev["name"] = DEVICE_NAME;
+  dev["manufacturer"] = "DIY ESP32-C3";
+  dev["model"] = "BlueConnect BLE MQTT Bridge";
+
+  String topic = "homeassistant/button/" + String(DEVICE_ID) + "/" + objectId + "/config";
+  publishJson(topic.c_str(), doc, true);
+}
+
 void publishDiscovery() {
   discoverySensor("temperature", "Pool Temperature", "temperature", "°C", "{{ value_json.temperature }}");
   discoverySensor("ph", "Pool pH", "ph", "", "{{ value_json.ph }}");
@@ -640,10 +725,14 @@ void publishDiscovery() {
   discoverySensor("salt", "Pool Salt", "", "ppm", "{{ value_json.salt }}");
   discoverySensor("battery", "BlueConnect Battery", "battery", "%", "{{ value_json.battery }}");
   discoverySensor("battery_voltage", "BlueConnect Battery Voltage", "voltage", "V", "{{ value_json.battery_voltage }}");
-  discoverySensor("rssi", "BlueConnect RSSI", "signal_strength", "dBm", "{{ value_json.rssi }}");
+  discoverySensor("rssi", "BlueConnect BLE RSSI", "signal_strength", "dBm", "{{ value_json.rssi }}");
+  discoverySensor("wifi_rssi", "BlueConnect WiFi RSSI", "signal_strength", "dBm", "{{ value_json.wifi_rssi }}");
   discoverySensor("ph_raw", "BlueConnect pH Raw", "", "", "{{ value_json.ph_raw }}", "");
   discoverySensor("battery_raw", "BlueConnect Battery Raw", "", "mV", "{{ value_json.battery_raw }}", "");
   discoverySensor("conductivity_raw", "BlueConnect Conductivity Raw", "", "", "{{ value_json.conductivity_raw }}", "");
+  discoveryButton("measure_now", "BlueConnect Measure Now", TOPIC_CMD_MEASURE);
+  discoveryButton("scan_ble", "BlueConnect BLE Scan", TOPIC_CMD_SCAN);
+  discoveryButton("reboot", "BlueConnect Reboot", TOPIC_CMD_REBOOT);
 }
 
 String htmlPage() {
@@ -744,6 +833,7 @@ void setupWeb() {
     doc["conductivity_raw"] = last.conductivityRaw;
     doc["status_raw"] = last.statusRaw;
     doc["rssi"] = last.rssi;
+    doc["wifi_rssi"] = WiFi.RSSI();
     doc["mac"] = last.mac;
     doc["raw_hex"] = last.rawHex;
     doc["last_error"] = last.lastError;
@@ -802,6 +892,16 @@ void loop() {
   }
   ensureMqtt();
   handleBackground();
+
+  if (rebootRequested) {
+    rebootRequested = false;
+    last.lastError = "rebooting";
+    publishDiagnostics("reboot_requested");
+    mqtt.publish(TOPIC_AVAIL, "offline", true);
+    mqtt.loop();
+    delay(250);
+    ESP.restart();
+  }
 
   const uint32_t intervalMs = lastReadOk ? MEASURE_INTERVAL_MS : MEASURE_RETRY_INTERVAL_MS;
   const bool scheduledMeasurementDue = lastAttemptMs == 0 || millis() - lastAttemptMs >= intervalMs;
